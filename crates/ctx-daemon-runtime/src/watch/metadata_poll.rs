@@ -18,11 +18,17 @@ use std::{
 };
 
 type Handler = Arc<dyn Fn(notify::Result<Event>) + Send + Sync>;
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EntryKind {
+    Directory,
+    Symlink,
+    Other,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Stamp {
     modified: Option<SystemTime>,
     len: u64,
-    kind: u8,
+    kind: EntryKind,
     identity: (u64, u64),
     created: Option<SystemTime>,
 }
@@ -39,7 +45,7 @@ impl Stamp {
         }
         // Entries within each subscription are compared separately. A directory's
         // own mtime must not invalidate every source and config below it.
-        if self.kind == 1 || self == prior {
+        if self.kind == EntryKind::Directory || self == prior {
             return None;
         }
         Some(EventKind::Modify(ModifyKind::Metadata(
@@ -50,6 +56,47 @@ impl Stamp {
 struct Root {
     recursive: bool,
     entries: BTreeMap<PathBuf, Stamp>,
+}
+impl Root {
+    fn poll(
+        &mut self,
+        path: &Path,
+        canceled: impl Fn() -> bool,
+        mut emit: impl FnMut(notify::Result<Event>),
+    ) {
+        let current = match scan(path, self.recursive, &canceled) {
+            Ok(current) => current,
+            Err(error) => {
+                if !canceled() {
+                    emit(Err(error));
+                }
+                return;
+            }
+        };
+        for (path, stamp) in &current {
+            if canceled() {
+                return;
+            }
+            if let Some(kind) = stamp.change_from(self.entries.get(path)) {
+                emit(Ok(Event::new(kind).add_path(path.clone())));
+            }
+        }
+        for path in self
+            .entries
+            .keys()
+            .filter(|path| !current.contains_key(*path))
+        {
+            if canceled() {
+                return;
+            }
+            emit(Ok(
+                Event::new(EventKind::Remove(RemoveKind::Any)).add_path(path.clone())
+            ));
+        }
+        if !canceled() {
+            self.entries = current;
+        }
+    }
 }
 pub(super) struct MetadataWatcher {
     roots: Arc<Mutex<BTreeMap<PathBuf, Root>>>,
@@ -78,38 +125,11 @@ impl MetadataWatcher {
                         if canceled.load(Ordering::Acquire) {
                             return;
                         }
-                        let current =
-                            match scan(path, root.recursive, || canceled.load(Ordering::Acquire)) {
-                                Ok(current) => current,
-                                Err(error) => {
-                                    if canceled.load(Ordering::Acquire) {
-                                        return;
-                                    }
-                                    handler(Err(error));
-                                    continue;
-                                }
-                            };
-                        for (path, stamp) in &current {
-                            if canceled.load(Ordering::Acquire) {
-                                return;
-                            }
-                            let kind = stamp.change_from(root.entries.get(path));
-                            if let Some(kind) = kind {
-                                handler(Ok(Event::new(kind).add_path(path.clone())));
-                            }
-                        }
-                        for path in root
-                            .entries
-                            .keys()
-                            .filter(|path| !current.contains_key(*path))
-                        {
-                            if canceled.load(Ordering::Acquire) {
-                                return;
-                            }
-                            handler(Ok(Event::new(EventKind::Remove(RemoveKind::Any))
-                                .add_path(path.clone())));
-                        }
-                        root.entries = current;
+                        root.poll(
+                            path,
+                            || canceled.load(Ordering::Acquire),
+                            |event| handler(event),
+                        );
                     }
                 }
             })
@@ -181,11 +201,11 @@ fn scan(
                 identity: (metadata.dev(), metadata.ino()),
                 created: metadata.created().ok(),
                 kind: if directory {
-                    1
+                    EntryKind::Directory
                 } else if metadata.file_type().is_symlink() {
-                    2
+                    EntryKind::Symlink
                 } else {
-                    0
+                    EntryKind::Other
                 },
             },
         );
@@ -283,7 +303,7 @@ mod tests {
         let prior = Stamp {
             modified: Some(SystemTime::UNIX_EPOCH),
             len: 64,
-            kind: 1,
+            kind: EntryKind::Directory,
             identity: (1, 2),
             created: Some(SystemTime::UNIX_EPOCH),
         };
@@ -327,24 +347,128 @@ mod tests {
         writer.write_all(b"first\n").unwrap();
         writer.flush().unwrap();
         let modified = writer.metadata().unwrap().modified().unwrap();
-        let (tx, rx) = mpsc::channel();
-        let mut watcher = MetadataWatcher::new(Arc::new(move |event| {
-            let _ = tx.send(event);
-        }))
-        .unwrap();
-        watcher
-            .watch(temp.path(), RecursiveMode::Recursive)
-            .unwrap();
+        let mut root = Root {
+            recursive: true,
+            entries: scan(temp.path(), true, || false).unwrap(),
+        };
         writer.write_all(b"second\n").unwrap();
         writer.flush().unwrap();
         writer
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        let event = rx
-            .recv_timeout(Duration::from_secs(8))
-            .expect("same-time size change must be observed")
-            .unwrap();
-        assert!(event.paths.contains(&path));
+        let mut events = Vec::new();
+        root.poll(temp.path(), || false, |event| events.push(event.unwrap()));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].paths, vec![path]);
+        assert_eq!(
+            events[0].kind,
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime))
+        );
+    }
+
+    #[test]
+    fn poll_reports_sibling_churn_without_parent_or_unchanged_config_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.toml");
+        std::fs::write(&config, b"unchanged").unwrap();
+        let mut root = Root {
+            recursive: false,
+            entries: scan(temp.path(), false, || false).unwrap(),
+        };
+        let lock = temp.path().join("settings.lock");
+        let pending = temp.path().join("settings.tmp");
+        let settings = temp.path().join("settings.json");
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(&pending, b"{}").unwrap();
+        let mut events = BTreeMap::new();
+        root.poll(
+            temp.path(),
+            || false,
+            |event| {
+                let event = event.unwrap();
+                events.insert(event.paths[0].clone(), event.kind);
+            },
+        );
+        assert_eq!(
+            events,
+            BTreeMap::from([
+                (lock.clone(), EventKind::Create(CreateKind::Any)),
+                (pending.clone(), EventKind::Create(CreateKind::Any)),
+            ])
+        );
+
+        std::fs::rename(&pending, &settings).unwrap();
+        std::fs::remove_dir(&lock).unwrap();
+        events.clear();
+        root.poll(
+            temp.path(),
+            || false,
+            |event| {
+                let event = event.unwrap();
+                events.insert(event.paths[0].clone(), event.kind);
+            },
+        );
+        assert_eq!(
+            events,
+            BTreeMap::from([
+                (settings, EventKind::Create(CreateKind::Any)),
+                (lock, EventKind::Remove(RemoveKind::Any)),
+                (pending, EventKind::Remove(RemoveKind::Any)),
+            ])
+        );
+        root.poll(
+            temp.path(),
+            || false,
+            |_| panic!("unchanged snapshot emitted an event"),
+        );
+    }
+
+    #[test]
+    fn failed_poll_preserves_baseline_and_reports_no_partial_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut root = Root {
+            recursive: true,
+            entries: scan(temp.path(), true, || false).unwrap(),
+        };
+        let baseline = root.entries.clone();
+        let mut nested = temp.path().to_path_buf();
+        for _ in 0..65 {
+            nested = nested.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+        }
+        let mut events = Vec::new();
+        root.poll(temp.path(), || false, |event| events.push(event));
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_err());
+        assert_eq!(root.entries, baseline);
+    }
+
+    #[test]
+    fn cancellation_during_event_delivery_preserves_baseline_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut root = Root {
+            recursive: false,
+            entries: scan(temp.path(), false, || false).unwrap(),
+        };
+        let baseline = root.entries.clone();
+        std::fs::write(temp.path().join("new.jsonl"), b"new").unwrap();
+        let canceled = std::cell::Cell::new(false);
+        let mut delivered = 0;
+        root.poll(
+            temp.path(),
+            || canceled.get(),
+            |event| {
+                assert!(event.is_ok());
+                delivered += 1;
+                canceled.set(true);
+            },
+        );
+        assert_eq!(delivered, 1);
+        assert_eq!(root.entries, baseline);
+        let mut retried = Vec::new();
+        root.poll(temp.path(), || false, |event| retried.push(event.unwrap()));
+        assert_eq!(retried.len(), 1);
+        assert!(root.entries.contains_key(&temp.path().join("new.jsonl")));
     }
 
     #[test]
