@@ -40,9 +40,19 @@ pub enum NativeWatchIgnore {
     AccessTime,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWatchChange {
+    Content,
+    /// Entry-local metadata with a known meaning, such as a write timestamp.
+    Metadata,
+    Structural,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeWatchEvent {
     pub paths: Vec<PathBuf>,
+    change: NativeWatchChange,
     needs_rescan: bool,
     requires_rearm: bool,
     ignored: Option<NativeWatchIgnore>,
@@ -52,14 +62,31 @@ impl NativeWatchEvent {
     pub fn ordinary(paths: Vec<PathBuf>) -> Self {
         Self {
             paths,
+            change: NativeWatchChange::Unknown,
             needs_rescan: false,
             requires_rearm: false,
             ignored: None,
         }
     }
 
+    pub fn content(paths: Vec<PathBuf>) -> Self {
+        Self {
+            change: NativeWatchChange::Content,
+            ..Self::ordinary(paths)
+        }
+    }
+
+    /// The caller must know the metadata change cannot affect descendant access.
+    pub fn metadata(paths: Vec<PathBuf>) -> Self {
+        Self {
+            change: NativeWatchChange::Metadata,
+            ..Self::ordinary(paths)
+        }
+    }
+
     pub fn requiring_rearm(paths: Vec<PathBuf>) -> Self {
         Self {
+            change: NativeWatchChange::Structural,
             requires_rearm: true,
             ..Self::ordinary(paths)
         }
@@ -68,6 +95,7 @@ impl NativeWatchEvent {
     pub fn rescan(paths: Vec<PathBuf>) -> Self {
         Self {
             paths,
+            change: NativeWatchChange::Unknown,
             needs_rescan: true,
             requires_rearm: true,
             ignored: None,
@@ -91,6 +119,16 @@ impl NativeWatchEvent {
 
     pub fn ignored_kind(&self) -> Option<NativeWatchIgnore> {
         self.ignored
+    }
+
+    pub fn change_kind(&self) -> NativeWatchChange {
+        self.change
+    }
+
+    /// Known entry metadata does not change descendant contents or access.
+    /// Content notifications can describe directory membership on some backends.
+    pub fn affects_descendants(&self) -> bool {
+        self.needs_rescan || self.change != NativeWatchChange::Metadata
     }
 }
 
@@ -123,8 +161,22 @@ fn normalize_native_watch_event(event: notify::Result<Event>) -> NativeWatchResu
             | EventKind::Remove(RemoveKind::Any | RemoveKind::Folder | RemoveKind::Other)
     );
     let needs_rescan = event.need_rescan();
+    let change = match event.kind {
+        EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::WriteTime | MetadataKind::AccessTime,
+        )) => NativeWatchChange::Metadata,
+        EventKind::Modify(ModifyKind::Data(_))
+        | EventKind::Access(AccessKind::Close(AccessMode::Write)) => NativeWatchChange::Content,
+        EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) => {
+            NativeWatchChange::Structural
+        }
+        // Permissions, ownership and unspecified metadata may change access
+        // below a directory. Keep their existing conservative routing scope.
+        _ => NativeWatchChange::Unknown,
+    };
     Ok(NativeWatchEvent {
         paths: event.paths,
+        change,
         needs_rescan,
         requires_rearm,
         ignored,

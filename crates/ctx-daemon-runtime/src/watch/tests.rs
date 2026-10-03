@@ -63,6 +63,93 @@ fn notify_events_are_normalized_without_product_policy() {
 }
 
 #[test]
+fn write_time_metadata_preserves_entry_scope() {
+    let event = normalize_native_watch_event(Ok(Event::new(EventKind::Modify(
+        ModifyKind::Metadata(MetadataKind::WriteTime),
+    ))
+    .add_path(PathBuf::from("watched-parent"))))
+    .unwrap();
+    assert_eq!(event.change_kind(), NativeWatchChange::Metadata);
+    assert!(!event.affects_descendants());
+    assert!(!event.requires_rearm());
+}
+
+#[test]
+fn access_affecting_and_unspecified_metadata_keep_descendant_scope() {
+    for kind in [
+        MetadataKind::Any,
+        MetadataKind::Permissions,
+        MetadataKind::Ownership,
+        MetadataKind::Extended,
+        MetadataKind::Other,
+    ] {
+        let event = normalize_native_watch_event(Ok(Event::new(EventKind::Modify(
+            ModifyKind::Metadata(kind),
+        ))
+        .add_path(PathBuf::from("watched-parent"))))
+        .unwrap();
+        assert_eq!(event.change_kind(), NativeWatchChange::Unknown);
+        assert!(event.affects_descendants(), "{kind:?}");
+        assert!(!event.requires_rearm());
+    }
+}
+
+#[test]
+fn structural_unknown_and_directory_content_events_keep_descendant_scope() {
+    for (kind, expected) in [
+        (
+            EventKind::Create(CreateKind::Folder),
+            NativeWatchChange::Structural,
+        ),
+        (
+            EventKind::Remove(RemoveKind::Folder),
+            NativeWatchChange::Structural,
+        ),
+        (
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any)),
+            NativeWatchChange::Structural,
+        ),
+        (EventKind::Any, NativeWatchChange::Unknown),
+        (EventKind::Other, NativeWatchChange::Unknown),
+        (
+            EventKind::Modify(ModifyKind::Any),
+            NativeWatchChange::Unknown,
+        ),
+        (
+            EventKind::Modify(ModifyKind::Other),
+            NativeWatchChange::Unknown,
+        ),
+        (
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            NativeWatchChange::Content,
+        ),
+        (
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            NativeWatchChange::Content,
+        ),
+    ] {
+        let event =
+            normalize_native_watch_event(Ok(Event::new(kind).add_path("watched-parent".into())))
+                .unwrap();
+        assert_eq!(event.change_kind(), expected);
+        assert!(event.affects_descendants(), "{kind:?}");
+    }
+}
+
+#[test]
+fn metadata_rescan_retains_uncertainty_scope() {
+    let event = normalize_native_watch_event(Ok(Event::new(EventKind::Modify(
+        ModifyKind::Metadata(MetadataKind::WriteTime),
+    ))
+    .add_path("watched-parent".into())
+    .set_flag(Flag::Rescan)))
+    .unwrap();
+    assert_eq!(event.change_kind(), NativeWatchChange::Metadata);
+    assert!(event.needs_rescan());
+    assert!(event.affects_descendants());
+}
+
+#[test]
 fn pressure_retains_only_the_maximum_lost_watermark() {
     let ingress = RawWatchIngress::default();
     ingress.record_loss(WatchWatermark::new(9, 4));
