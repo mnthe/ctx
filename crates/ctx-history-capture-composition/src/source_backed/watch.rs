@@ -132,12 +132,27 @@ impl SourceBackedWatchCatalog {
     /// ancestors/descendants. A target is recursive only while it is an actual
     /// directory; missing targets therefore cannot match sibling basenames.
     pub fn routes_overlapping_path(&self, event: &Path) -> BTreeSet<SourceRouteIdentity> {
+        self.routes_matching_path(event, true)
+    }
+
+    /// Maps entry-local changes without treating an ancestor's write time as a
+    /// change to every source below it. Exact targets and their members remain
+    /// relevant, including directory targets whose own write time changed.
+    pub fn routes_containing_path(&self, event: &Path) -> BTreeSet<SourceRouteIdentity> {
+        self.routes_matching_path(event, false)
+    }
+
+    fn routes_matching_path(
+        &self,
+        event: &Path,
+        include_ancestors: bool,
+    ) -> BTreeSet<SourceRouteIdentity> {
         self.routes
             .iter()
             .filter(|(_, route)| {
                 route.targets.iter().any(|target| {
                     target == event
-                        || target.starts_with(event)
+                        || (include_ancestors && target.starts_with(event))
                         || (target.is_dir() && event.starts_with(target))
                 })
             })

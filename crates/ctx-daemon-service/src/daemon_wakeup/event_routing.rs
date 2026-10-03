@@ -87,10 +87,9 @@ pub(super) fn record_watch_event(
             continue;
         }
         let mut path_matched = false;
-        let control_matched = authority_snapshot
-            .controls
-            .iter()
-            .any(|target| declared_control_paths_overlap(target, event_path));
+        let control_matched = authority_snapshot.controls.iter().any(|target| {
+            declared_control_paths_overlap(target, event_path, event.affects_descendants())
+        });
         if control_matched {
             batch.reconcile = Some(watermark);
             path_matched = true;
@@ -101,7 +100,12 @@ pub(super) fn record_watch_event(
             continue;
         }
         if let Some(catalog) = catalog.as_ref() {
-            for route in catalog.routes_overlapping_path(event_path) {
+            let routes = if event.affects_descendants() {
+                catalog.routes_overlapping_path(event_path)
+            } else {
+                catalog.routes_containing_path(event_path)
+            };
+            for route in routes {
                 if !control_matched
                     && !event.requires_rearm()
                     && catalog.event_is_known_non_source_file(&route, event_path)
@@ -190,6 +194,8 @@ pub(super) fn record_ignored_watch_event(
     }
 }
 
-fn declared_control_paths_overlap(target: &Path, event: &Path) -> bool {
-    target == event || target.starts_with(event) || event.starts_with(target)
+fn declared_control_paths_overlap(target: &Path, event: &Path, affects_descendants: bool) -> bool {
+    target == event
+        || (affects_descendants && target.starts_with(event))
+        || event.starts_with(target)
 }
